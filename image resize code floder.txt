@@ -1,0 +1,1437 @@
+import boto3
+import io
+import os
+import urllib.parse
+import logging
+
+from PIL import (
+    Image,
+    ImageOps,
+    ImageFilter,
+    ImageEnhance,
+    UnidentifiedImageError,
+)
+
+
+# ============================================================
+# AWS
+# ============================================================
+
+s3 = boto3.client("s3")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BUCKET_NAME = "stylo-captain-bucket"
+
+# USERS UPLOAD HERE
+INPUT_PREFIX = "compressed-images/"
+
+# ORIGINAL BACKUP
+BACKUP_PREFIX = "Original-Salon-Images/"
+
+# Prevent Lambda from processing its own output again
+PROCESSED_METADATA_KEY = "image-resizer-processed"
+PROCESSED_METADATA_VALUE = "true"
+
+
+# ============================================================
+# SIZE UNITS
+# ============================================================
+
+KB = 1024
+MB = 1024 * KB
+
+
+# ============================================================
+# IMAGE SIZE RULES
+# ============================================================
+
+# <= 100 KB
+# Completely unchanged
+NO_RESIZE_LIMIT = 100 * KB
+
+
+# ------------------------------------------------------------
+# >100 KB and <1 MB
+# Final: 50 KB - 100 KB
+# ------------------------------------------------------------
+
+RANGE_1_INPUT_MAX = 1 * MB
+
+RANGE_1_MIN = 50 * KB
+RANGE_1_MAX = 100 * KB
+RANGE_1_TARGET = 90 * KB
+
+
+# ------------------------------------------------------------
+# 1 MB - 4 MB
+# Final: 80 KB - 120 KB
+# ------------------------------------------------------------
+
+RANGE_2_INPUT_MAX = 4 * MB
+
+RANGE_2_MIN = 80 * KB
+RANGE_2_MAX = 120 * KB
+RANGE_2_TARGET = 105 * KB
+
+
+# ------------------------------------------------------------
+# >4 MB
+# Final: 100 KB - 150 KB
+# ------------------------------------------------------------
+
+RANGE_3_MIN = 100 * KB
+RANGE_3_MAX = 150 * KB
+RANGE_3_TARGET = 130 * KB
+
+
+# ============================================================
+# JPEG QUALITY
+# ============================================================
+
+MAX_QUALITY = 95
+MIN_QUALITY = 60
+
+
+# ============================================================
+# MAXIMUM SOURCE DIMENSIONS
+# ============================================================
+
+MAX_WIDTH = 6000
+MAX_HEIGHT = 6000
+
+
+# ============================================================
+# LAMBDA HANDLER
+# ============================================================
+
+def lambda_handler(event, context):
+
+    logger.info("========================================")
+    logger.info("IMAGE RESIZER STARTED")
+    logger.info("========================================")
+
+    results = []
+
+    try:
+
+        # ====================================================
+        # NORMAL S3 TRIGGER
+        # ====================================================
+
+        records = event.get("Records", [])
+
+        if records:
+
+            for record in records:
+
+                result = process_s3_record(
+                    record
+                )
+
+                if result is not None:
+                    results.append(result)
+
+        # ====================================================
+        # EXISTING IMAGE BACKFILL
+        #
+        # Test event:
+        #
+        # {
+        #   "mode": "backfill"
+        # }
+        # ====================================================
+
+        elif event.get("mode") == "backfill":
+
+            results = backfill_existing_images()
+
+        else:
+
+            logger.info(
+                "No S3 records and no backfill mode."
+            )
+
+            return {
+                "statusCode": 200,
+                "message": "Nothing to process"
+            }
+
+        logger.info("========================================")
+        logger.info("IMAGE RESIZER FINISHED")
+        logger.info("========================================")
+
+        return {
+            "statusCode": 200,
+            "message": "Image processing completed",
+            "results": results
+        }
+
+    except Exception as e:
+
+        logger.exception(
+            "IMAGE PROCESSING FAILED"
+        )
+
+        return {
+            "statusCode": 500,
+            "error": str(e)
+        }
+
+
+# ============================================================
+# PROCESS NORMAL S3 EVENT
+# ============================================================
+
+def process_s3_record(record):
+
+    bucket = record["s3"]["bucket"]["name"]
+
+    encoded_key = record["s3"]["object"]["key"]
+
+    key = urllib.parse.unquote_plus(
+        encoded_key
+    )
+
+    logger.info("----------------------------------------")
+    logger.info(
+        "Bucket: %s",
+        bucket
+    )
+
+    logger.info(
+        "Uploaded object: %s",
+        key
+    )
+
+    # ========================================================
+    # ONLY compressed-images/
+    # ========================================================
+
+    if not key.startswith(INPUT_PREFIX):
+
+        logger.info(
+            "Ignoring object outside %s",
+            INPUT_PREFIX
+        )
+
+        return {
+            "input": key,
+            "status": "ignored",
+            "reason": "Outside compressed-images/"
+        }
+
+    # ========================================================
+    # IGNORE FOLDER PLACEHOLDERS
+    # ========================================================
+
+    if key.endswith("/"):
+
+        logger.info(
+            "Ignoring folder placeholder."
+        )
+
+        return {
+            "input": key,
+            "status": "ignored",
+            "reason": "Folder placeholder"
+        }
+
+    # ========================================================
+    # PREVENT RECURSIVE PROCESSING
+    # ========================================================
+
+    try:
+
+        head = s3.head_object(
+            Bucket=bucket,
+            Key=key
+        )
+
+        metadata = head.get(
+            "Metadata",
+            {}
+        )
+
+        if (
+            metadata.get(
+                PROCESSED_METADATA_KEY
+            )
+            == PROCESSED_METADATA_VALUE
+        ):
+
+            logger.info(
+                "Ignoring Lambda-generated object: %s",
+                key
+            )
+
+            return {
+                "input": key,
+                "status": "ignored",
+                "reason": "Already processed by Lambda"
+            }
+
+    except Exception:
+
+        logger.exception(
+            "Could not read object metadata: %s",
+            key
+        )
+
+        raise
+
+    # ========================================================
+    # PROCESS IMAGE
+    # ========================================================
+
+    return process_image(
+        bucket=bucket,
+        source_key=key
+    )
+
+
+# ============================================================
+# PROCESS ONE IMAGE
+# ============================================================
+
+def process_image(
+    bucket,
+    source_key
+):
+
+    logger.info("----------------------------------------")
+
+    logger.info(
+        "Processing image: %s",
+        source_key
+    )
+
+    # ========================================================
+    # KEEP COMPLETE RELATIVE PATH
+    #
+    # Example:
+    #
+    # compressed-images/101/chairsMirrorsLighting1
+    #
+    # becomes:
+    #
+    # 101/chairsMirrorsLighting1
+    # ========================================================
+
+    relative_key = source_key[
+        len(INPUT_PREFIX):
+    ]
+
+    if not relative_key:
+
+        return {
+            "input": source_key,
+            "status": "ignored",
+            "reason": "Empty relative path"
+        }
+
+    # ========================================================
+    # ORIGINAL BACKUP PATH
+    #
+    # Example:
+    #
+    # compressed-images/101/chairsMirrorsLighting1
+    #
+    # becomes:
+    #
+    # Original-Salon-Images/101/chairsMirrorsLighting1
+    # ========================================================
+
+    backup_key = (
+        BACKUP_PREFIX
+        + relative_key
+    )
+
+    # ========================================================
+    # DOWNLOAD ORIGINAL OBJECT
+    #
+    # IMPORTANT:
+    # No filename extension is required.
+    # ========================================================
+
+    logger.info(
+        "Downloading object..."
+    )
+
+    response = s3.get_object(
+        Bucket=bucket,
+        Key=source_key
+    )
+
+    original_data = response["Body"].read()
+
+    original_size = len(
+        original_data
+    )
+
+    original_kb = (
+        original_size / KB
+    )
+
+    logger.info(
+        "Original size: %.2f KB",
+        original_kb
+    )
+
+    # ========================================================
+    # EMPTY OBJECT CHECK
+    # ========================================================
+
+    if original_size == 0:
+
+        logger.warning(
+            "Object is 0 bytes: %s",
+            source_key
+        )
+
+        return {
+            "input": source_key,
+            "status": "ignored",
+            "reason": "Object is 0 bytes"
+        }
+
+    # ========================================================
+    # OPEN IMAGE FROM ACTUAL BYTES
+    #
+    # THIS IS THE IMPORTANT FIX.
+    #
+    # We do NOT use the filename extension.
+    # Pillow identifies the actual image format.
+    # ========================================================
+
+    try:
+
+        image = Image.open(
+            io.BytesIO(original_data)
+        )
+
+        # Force Pillow to read image data
+        image.verify()
+
+        # Open again after verify()
+        image = Image.open(
+            io.BytesIO(original_data)
+        )
+
+    except UnidentifiedImageError:
+
+        logger.warning(
+            "Object is not a supported image: %s",
+            source_key
+        )
+
+        return {
+            "input": source_key,
+            "status": "ignored",
+            "reason": "Pillow could not identify image"
+        }
+
+    except Exception as e:
+
+        logger.warning(
+            "Could not read image %s: %s",
+            source_key,
+            str(e)
+        )
+
+        return {
+            "input": source_key,
+            "status": "ignored",
+            "reason": f"Invalid image: {str(e)}"
+        }
+
+    # ========================================================
+    # ACTUAL IMAGE FORMAT
+    # ========================================================
+
+    detected_format = image.format
+
+    logger.info(
+        "Detected image format: %s",
+        detected_format
+    )
+
+    logger.info(
+        "Original dimensions: %sx%s",
+        image.width,
+        image.height
+    )
+
+    logger.info(
+        "Original mode: %s",
+        image.mode
+    )
+
+    # ========================================================
+    # CREATE ORIGINAL BACKUP FIRST
+    #
+    # SAME FOLDER
+    # SAME FILE NAME
+    # NO EXTENSION IS ADDED
+    # ========================================================
+
+    logger.info(
+        "Creating original backup:"
+    )
+
+    logger.info(
+        "%s",
+        backup_key
+    )
+
+    s3.copy_object(
+        Bucket=bucket,
+        Key=backup_key,
+        CopySource={
+            "Bucket": bucket,
+            "Key": source_key
+        }
+    )
+
+    logger.info(
+        "Original backup created successfully."
+    )
+
+    # ========================================================
+    # <=100 KB
+    #
+    # DO NOT MODIFY IMAGE
+    #
+    # The object stays exactly as uploaded.
+    # ========================================================
+
+    if original_size <= NO_RESIZE_LIMIT:
+
+        logger.info(
+            "Image <=100 KB."
+        )
+
+        logger.info(
+            "Leaving image completely unchanged."
+        )
+
+        return {
+            "input": source_key,
+            "backup": backup_key,
+            "output": source_key,
+            "status": "unchanged",
+            "detected_format": detected_format,
+            "original_size_kb": round(
+                original_kb,
+                2
+            ),
+            "final_size_kb": round(
+                original_kb,
+                2
+            ),
+            "width": image.width,
+            "height": image.height
+        }
+
+    # ========================================================
+    # DETERMINE OUTPUT SIZE RANGE
+    # ========================================================
+
+    if original_size < RANGE_1_INPUT_MAX:
+
+        min_bytes = RANGE_1_MIN
+        max_bytes = RANGE_1_MAX
+        target_bytes = RANGE_1_TARGET
+
+        category = (
+            ">100 KB and <1 MB"
+        )
+
+    elif original_size <= RANGE_2_INPUT_MAX:
+
+        min_bytes = RANGE_2_MIN
+        max_bytes = RANGE_2_MAX
+        target_bytes = RANGE_2_TARGET
+
+        category = "1 MB - 4 MB"
+
+    else:
+
+        min_bytes = RANGE_3_MIN
+        max_bytes = RANGE_3_MAX
+        target_bytes = RANGE_3_TARGET
+
+        category = ">4 MB"
+
+    logger.info(
+        "Input category: %s",
+        category
+    )
+
+    logger.info(
+        "Required output: %.0f - %.0f KB",
+        min_bytes / KB,
+        max_bytes / KB
+    )
+
+    # ========================================================
+    # FIX EXIF ORIENTATION
+    # ========================================================
+
+    image = ImageOps.exif_transpose(
+        image
+    )
+
+    # ========================================================
+    # ANIMATED IMAGE
+    # ========================================================
+
+    if getattr(
+        image,
+        "is_animated",
+        False
+    ):
+
+        logger.info(
+            "Animated image detected."
+        )
+
+        logger.info(
+            "Using first frame."
+        )
+
+        image.seek(0)
+
+        image = image.copy()
+
+    # ========================================================
+    # SAVE ICC PROFILE
+    # ========================================================
+
+    icc_profile = image.info.get(
+        "icc_profile"
+    )
+
+    # ========================================================
+    # CONVERT TO RGB
+    # ========================================================
+
+    image = convert_to_rgb(
+        image
+    )
+
+    # ========================================================
+    # LIMIT ONLY EXTREMELY LARGE SOURCE
+    # ========================================================
+
+    image = limit_source_dimensions(
+        image
+    )
+
+    # ========================================================
+    # MILD ENHANCEMENT
+    # ========================================================
+
+    image = enhance_image(
+        image
+    )
+
+    # ========================================================
+    # FIND HIGHEST QUALITY
+    # + MAXIMUM POSSIBLE RESOLUTION
+    # ========================================================
+
+    (
+        output_data,
+        quality,
+        width,
+        height
+    ) = find_best_image(
+        image=image,
+        min_bytes=min_bytes,
+        max_bytes=max_bytes,
+        target_bytes=target_bytes,
+        icc_profile=icc_profile
+    )
+
+    final_size = len(
+        output_data
+    )
+
+    final_kb = (
+        final_size / KB
+    )
+
+    # ========================================================
+    # FINAL INFORMATION
+    # ========================================================
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "FINAL IMAGE"
+    )
+
+    logger.info(
+        "Original format: %s",
+        detected_format
+    )
+
+    logger.info(
+        "Final format: JPEG"
+    )
+
+    logger.info(
+        "Original size: %.2f KB",
+        original_kb
+    )
+
+    logger.info(
+        "Final size: %.2f KB",
+        final_kb
+    )
+
+    logger.info(
+        "Quality: %s",
+        quality
+    )
+
+    logger.info(
+        "Dimensions: %sx%s",
+        width,
+        height
+    )
+
+    logger.info(
+        "Megapixels: %.2f",
+        (width * height) / 1000000
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    # ========================================================
+    # HARD MINIMUM CHECK
+    # ========================================================
+
+    if final_size < min_bytes:
+
+        raise RuntimeError(
+            f"Output too small: "
+            f"{final_kb:.2f} KB. "
+            f"Minimum required: "
+            f"{min_bytes / KB:.0f} KB."
+        )
+
+    # ========================================================
+    # HARD MAXIMUM CHECK
+    # ========================================================
+
+    if final_size > max_bytes:
+
+        raise RuntimeError(
+            f"Output too large: "
+            f"{final_kb:.2f} KB. "
+            f"Maximum allowed: "
+            f"{max_bytes / KB:.0f} KB."
+        )
+
+    # ========================================================
+    # IMPORTANT:
+    #
+    # KEEP EXACT SAME S3 KEY.
+    #
+    # Example:
+    #
+    # compressed-images/101/chairsMirrorsLighting1
+    #
+    # remains:
+    #
+    # compressed-images/101/chairsMirrorsLighting1
+    #
+    # NO .jpg IS ADDED.
+    # ========================================================
+
+    output_key = source_key
+
+    logger.info(
+        "Writing resized image back to:"
+    )
+
+    logger.info(
+        "%s",
+        output_key
+    )
+
+    # ========================================================
+    # UPLOAD PROCESSED IMAGE
+    #
+    # Metadata marker prevents recursive processing.
+    # ========================================================
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=output_key,
+        Body=output_data,
+        ContentType="image/jpeg",
+        CacheControl="max-age=31536000",
+        Metadata={
+            PROCESSED_METADATA_KEY:
+                PROCESSED_METADATA_VALUE
+        }
+    )
+
+    logger.info(
+        "Resized image uploaded successfully."
+    )
+
+    return {
+        "input": source_key,
+        "backup": backup_key,
+        "output": output_key,
+        "status": "processed",
+        "detected_format": detected_format,
+        "category": category,
+        "original_size_kb": round(
+            original_kb,
+            2
+        ),
+        "final_size_kb": round(
+            final_kb,
+            2
+        ),
+        "quality": quality,
+        "width": width,
+        "height": height,
+        "megapixels": round(
+            (width * height) / 1000000,
+            2
+        )
+    }
+
+
+# ============================================================
+# BACKFILL EXISTING IMAGES
+#
+# Processes ALL existing objects recursively under:
+#
+# compressed-images/
+#
+# Test event:
+#
+# {
+#   "mode": "backfill"
+# }
+#
+# ============================================================
+
+def backfill_existing_images():
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "EXISTING IMAGE BACKFILL STARTED"
+    )
+
+    logger.info(
+        "Source: %s",
+        INPUT_PREFIX
+    )
+
+    logger.info(
+        "Backup: %s",
+        BACKUP_PREFIX
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    results = []
+
+    paginator = s3.get_paginator(
+        "list_objects_v2"
+    )
+
+    for page in paginator.paginate(
+        Bucket=BUCKET_NAME,
+        Prefix=INPUT_PREFIX
+    ):
+
+        objects = page.get(
+            "Contents",
+            []
+        )
+
+        for obj in objects:
+
+            key = obj["Key"]
+
+            # =================================================
+            # IGNORE FOLDER PLACEHOLDER
+            # =================================================
+
+            if key.endswith("/"):
+
+                continue
+
+            # =================================================
+            # READ METADATA FIRST
+            # =================================================
+
+            try:
+
+                head = s3.head_object(
+                    Bucket=BUCKET_NAME,
+                    Key=key
+                )
+
+            except Exception as e:
+
+                logger.exception(
+                    "Could not read object: %s",
+                    key
+                )
+
+                results.append({
+                    "input": key,
+                    "status": "failed",
+                    "error": str(e)
+                })
+
+                continue
+
+            metadata = head.get(
+                "Metadata",
+                {}
+            )
+
+            # =================================================
+            # ALREADY PROCESSED
+            # =================================================
+
+            if (
+                metadata.get(
+                    PROCESSED_METADATA_KEY
+                )
+                == PROCESSED_METADATA_VALUE
+            ):
+
+                logger.info(
+                    "Already processed: %s",
+                    key
+                )
+
+                results.append({
+                    "input": key,
+                    "status": "already_processed"
+                })
+
+                continue
+
+            # =================================================
+            # PROCESS ACTUAL IMAGE
+            #
+            # NO FILE EXTENSION REQUIRED
+            # =================================================
+
+            try:
+
+                result = process_image(
+                    bucket=BUCKET_NAME,
+                    source_key=key
+                )
+
+                results.append(
+                    result
+                )
+
+            except Exception as e:
+
+                logger.exception(
+                    "Failed processing existing image: %s",
+                    key
+                )
+
+                results.append({
+                    "input": key,
+                    "status": "failed",
+                    "error": str(e)
+                })
+
+    logger.info(
+        "========================================"
+    )
+
+    logger.info(
+        "EXISTING IMAGE BACKFILL FINISHED"
+    )
+
+    logger.info(
+        "Total objects inspected: %s",
+        len(results)
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    return results
+
+
+# ============================================================
+# CONVERT IMAGE TO RGB
+# ============================================================
+
+def convert_to_rgb(image):
+
+    # --------------------------------------------------------
+    # RGB
+    # --------------------------------------------------------
+
+    if image.mode == "RGB":
+
+        return image
+
+    # --------------------------------------------------------
+    # RGBA
+    #
+    # Transparent areas become white.
+    # --------------------------------------------------------
+
+    if image.mode == "RGBA":
+
+        background = Image.new(
+            "RGB",
+            image.size,
+            (255, 255, 255)
+        )
+
+        alpha = image.getchannel(
+            "A"
+        )
+
+        background.paste(
+            image,
+            mask=alpha
+        )
+
+        return background
+
+    # --------------------------------------------------------
+    # Palette
+    # --------------------------------------------------------
+
+    if image.mode == "P":
+
+        image = image.convert(
+            "RGBA"
+        )
+
+        background = Image.new(
+            "RGB",
+            image.size,
+            (255, 255, 255)
+        )
+
+        alpha = image.getchannel(
+            "A"
+        )
+
+        background.paste(
+            image,
+            mask=alpha
+        )
+
+        return background
+
+    # --------------------------------------------------------
+    # Grayscale / CMYK / other
+    # --------------------------------------------------------
+
+    return image.convert(
+        "RGB"
+    )
+
+
+# ============================================================
+# LIMIT EXTREMELY LARGE IMAGE
+# ============================================================
+
+def limit_source_dimensions(image):
+
+    width = image.width
+    height = image.height
+
+    if (
+        width <= MAX_WIDTH
+        and height <= MAX_HEIGHT
+    ):
+
+        return image
+
+    scale_width = (
+        MAX_WIDTH / width
+    )
+
+    scale_height = (
+        MAX_HEIGHT / height
+    )
+
+    scale = min(
+        scale_width,
+        scale_height
+    )
+
+    new_width = max(
+        1,
+        int(width * scale)
+    )
+
+    new_height = max(
+        1,
+        int(height * scale)
+    )
+
+    logger.info(
+        "Large source detected."
+    )
+
+    logger.info(
+        "Dimensions: %sx%s -> %sx%s",
+        width,
+        height,
+        new_width,
+        new_height
+    )
+
+    return image.resize(
+        (
+            new_width,
+            new_height
+        ),
+        Image.Resampling.LANCZOS
+    )
+
+
+# ============================================================
+# MILD IMAGE ENHANCEMENT
+# ============================================================
+
+def enhance_image(image):
+
+    # Slight color improvement
+    image = ImageEnhance.Color(
+        image
+    ).enhance(
+        1.05
+    )
+
+    # Slight contrast improvement
+    image = ImageEnhance.Contrast(
+        image
+    ).enhance(
+        1.03
+    )
+
+    # Mild sharpening
+    image = image.filter(
+        ImageFilter.UnsharpMask(
+            radius=0.5,
+            percent=55,
+            threshold=3
+        )
+    )
+
+    return image
+
+
+# ============================================================
+# JPEG ENCODER
+# ============================================================
+
+def encode_jpeg(
+    image,
+    quality,
+    icc_profile=None
+):
+
+    buffer = io.BytesIO()
+
+    options = {
+        "format": "JPEG",
+        "quality": quality,
+        "optimize": True,
+        "progressive": True,
+        "subsampling": "4:4:4",
+    }
+
+    if icc_profile:
+
+        options["icc_profile"] = (
+            icc_profile
+        )
+
+    image.save(
+        buffer,
+        **options
+    )
+
+    return buffer.getvalue()
+
+
+# ============================================================
+# FIND BEST IMAGE
+#
+# Priority:
+# 1. Required file-size range
+# 2. Maximum possible resolution
+# 3. Highest possible JPEG quality
+# ============================================================
+
+def find_best_image(
+    image,
+    min_bytes,
+    max_bytes,
+    target_bytes,
+    icc_profile=None
+):
+
+    original_width = image.width
+    original_height = image.height
+
+    # ========================================================
+    # FIRST:
+    #
+    # Try 100% original resolution.
+    # ========================================================
+
+    result = find_best_quality(
+        image=image,
+        min_bytes=min_bytes,
+        max_bytes=max_bytes,
+        icc_profile=icc_profile
+    )
+
+    if result is not None:
+
+        data, quality = result
+
+        logger.info(
+            "Original resolution is usable."
+        )
+
+        return (
+            data,
+            quality,
+            image.width,
+            image.height
+        )
+
+    # ========================================================
+    # ORIGINAL RESOLUTION TOO LARGE
+    #
+    # Find maximum usable resolution.
+    # ========================================================
+
+    logger.info(
+        "Original resolution cannot satisfy "
+        "required size."
+    )
+
+    logger.info(
+        "Searching maximum usable resolution."
+    )
+
+    low_scale = 0.10
+    high_scale = 1.0
+
+    best_result = None
+    best_scale = 0
+
+    # 25 iterations for fine resolution search
+    for iteration in range(25):
+
+        scale = (
+            low_scale
+            + high_scale
+        ) / 2
+
+        new_width = max(
+            200,
+            int(
+                original_width
+                * scale
+            )
+        )
+
+        new_height = max(
+            200,
+            int(
+                original_height
+                * scale
+            )
+        )
+
+        logger.info(
+            "Resolution iteration %s: "
+            "%.6f -> %sx%s",
+            iteration + 1,
+            scale,
+            new_width,
+            new_height
+        )
+
+        candidate = image.resize(
+            (
+                new_width,
+                new_height
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+        candidate = candidate.filter(
+            ImageFilter.UnsharpMask(
+                radius=0.45,
+                percent=50,
+                threshold=3
+            )
+        )
+
+        result = find_best_quality(
+            image=candidate,
+            min_bytes=min_bytes,
+            max_bytes=max_bytes,
+            icc_profile=icc_profile
+        )
+
+        if result is not None:
+
+            data, quality = result
+
+            best_result = (
+                data,
+                quality,
+                new_width,
+                new_height
+            )
+
+            best_scale = scale
+
+            # Can try higher resolution
+            low_scale = scale
+
+        else:
+
+            # Resolution is too large
+            high_scale = scale
+
+    if best_result is not None:
+
+        logger.info(
+            "Maximum usable resolution found."
+        )
+
+        logger.info(
+            "Scale: %.6f",
+            best_scale
+        )
+
+        return best_result
+
+    raise RuntimeError(
+        "Could not produce image inside "
+        "required size range."
+    )
+
+
+# ============================================================
+# FIND HIGHEST JPEG QUALITY THAT FITS
+# ============================================================
+
+def find_best_quality(
+    image,
+    min_bytes,
+    max_bytes,
+    icc_profile=None
+):
+
+    low = MIN_QUALITY
+    high = MAX_QUALITY
+
+    best_data = None
+    best_quality = None
+
+    while low <= high:
+
+        quality = (
+            low + high
+        ) // 2
+
+        data = encode_jpeg(
+            image,
+            quality,
+            icc_profile
+        )
+
+        size = len(
+            data
+        )
+
+        logger.info(
+            "Quality %s -> %.2f KB",
+            quality,
+            size / KB
+        )
+
+        # ====================================================
+        # VALID SIZE
+        # ====================================================
+
+        if (
+            min_bytes
+            <= size
+            <= max_bytes
+        ):
+
+            best_data = data
+            best_quality = quality
+
+            # Try higher quality
+            low = quality + 1
+
+        # ====================================================
+        # TOO LARGE
+        # ====================================================
+
+        elif size > max_bytes:
+
+            high = quality - 1
+
+        # ====================================================
+        # TOO SMALL
+        # ====================================================
+
+        else:
+
+            low = quality + 1
+
+    if best_data is not None:
+
+        return (
+            best_data,
+            best_quality
+        )
+
+    return None
